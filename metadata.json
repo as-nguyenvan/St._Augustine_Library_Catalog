@@ -1,0 +1,6 @@
+{
+  "name": "BiblioSheet Live Library Catalog",
+  "description": "Live online library catalog synced with Google Sheets featuring instant book search, ISBN barcode scanning, and printable custom ISBN barcode generation for unindexed books.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
