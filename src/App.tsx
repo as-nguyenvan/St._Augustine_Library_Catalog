@@ -231,12 +231,14 @@ export default function App() {
     }
   }, [accessToken, sheetMeta, selectedTab, fetchBooksFromServer]);
 
-  // Live Auto-Sync polling every 8 seconds when enabled
+  // Live Auto-Sync polling when enabled and tab is visible
   useEffect(() => {
     if (!autoPollEnabled) return;
     const timer = setInterval(() => {
-      handleSyncFromSheet();
-    }, 8000);
+      if (document.visibilityState === 'visible') {
+        handleSyncFromSheet();
+      }
+    }, 20000);
     return () => clearInterval(timer);
   }, [autoPollEnabled, handleSyncFromSheet]);
 
@@ -528,8 +530,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 text-slate-900 flex flex-col">
-      {/* Responsive Top Bar that fits iPhone width (375px+) without horizontal scrolling */}
-      <header className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3.5 bg-white border-b border-slate-200 no-print">
+      {/* Responsive Top Bar that fits iPhone width (375px+) without horizontal scrolling and centers the navigation tab */}
+      <header className="relative flex flex-wrap items-center justify-between sm:grid sm:grid-cols-3 gap-3 px-4 sm:px-6 py-3.5 bg-white border-b border-slate-200 no-print">
         {/* Zone 1: Wordmark */}
         <a
           href="#catalog-top"
@@ -537,13 +539,13 @@ export default function App() {
             e.preventDefault();
             setActiveTab('catalog');
           }}
-          className="text-base sm:text-lg font-bold tracking-tight text-slate-900 font-display"
+          className="text-base sm:text-lg font-bold tracking-tight text-slate-900 font-display sm:justify-self-start"
         >
           St. Augustine&apos;s Library Catalog
         </a>
 
         {/* Zone 3 on Mobile / Right Action: Librarian Sign In / Sign Out */}
-        <div className="flex items-center gap-2 sm:order-3">
+        <div className="flex items-center gap-2 sm:order-3 sm:justify-self-end">
           {!user ? (
             <GoogleSignInButton
               onClick={handleGoogleSignIn}
@@ -560,10 +562,10 @@ export default function App() {
           )}
         </div>
 
-        {/* Zone 2: Navigation Tabs (Spreadsheet & Scanner and Barcode strictly hidden unless signed in as Librarian) */}
+        {/* Zone 2: Centered Navigation Tabs (Spreadsheet & Scanner and Barcode strictly hidden unless signed in as Librarian) */}
         <nav
           aria-label="Primary Navigation"
-          className="w-full sm:w-auto sm:order-2 flex flex-wrap items-center gap-4 sm:gap-6 text-xs sm:text-sm font-medium text-slate-600 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-100"
+          className="w-full sm:w-auto sm:order-2 sm:justify-self-center flex flex-wrap items-center justify-center gap-4 sm:gap-6 text-xs sm:text-sm font-medium text-slate-600 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-100"
         >
           <button
             type="button"

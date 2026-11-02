@@ -1,4 +1,5 @@
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
@@ -15,6 +16,10 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Local zero-cost persistent JSON file cache so catalog updates survive restarts with $0 database cost
+const DATA_DIR = path.join(__dirname, 'data');
+const CATALOG_CACHE_FILE = path.join(DATA_DIR, 'catalog-cache.json');
 
 // Built-in fast lookup catalog for common ISBNs + fallback when offline
 const KNOWN_ISBN_CATALOG: Record<
@@ -105,6 +110,19 @@ const KNOWN_ISBN_CATALOG: Record<
     publishedYear: '2003',
   },
 };
+
+// In-memory cache of resolved ISBN metadata so OpenLibrary is queried at most once per unique ISBN
+const isbnMetadataCache = new Map<
+  string,
+  {
+    title: string;
+    author: string;
+    category: string;
+    roomLocation: string;
+    publishedYear: string;
+    isCustomIsbn: boolean;
+  }
+>();
 
 // Registry mapping custom generated ISBN-13s (for books without publisher ISBNs) to their Title, Author & Room Location
 const customIsbnRegistry = new Map<
@@ -251,6 +269,74 @@ let connectedSheetInfo: {
   lastSyncedAt: string;
 } | null = null;
 
+function loadPersistedCatalogCache() {
+  try {
+    if (fs.existsSync(CATALOG_CACHE_FILE)) {
+      const raw = fs.readFileSync(CATALOG_CACHE_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.books) && parsed.books.length > 0) {
+        booksList = parsed.books;
+      }
+      if (parsed.connectedSheet) {
+        connectedSheetInfo = parsed.connectedSheet;
+      }
+    }
+  } catch {
+    // Use default initialBooks if cache file doesn't exist yet
+  }
+}
+
+function savePersistedCatalogCache() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(
+      CATALOG_CACHE_FILE,
+      JSON.stringify(
+        {
+          books: booksList,
+          connectedSheet: connectedSheetInfo,
+        },
+        null,
+        2
+      ),
+      'utf-8'
+    );
+  } catch {
+    // Ignore write errors in read-only environments
+  }
+}
+
+loadPersistedCatalogCache();
+
+/**
+ * Reads Firebase Auth configuration strictly on the server so firebase-applet-config.json
+ * is never imported into client code or publicly downloadable as a static file.
+ */
+function getServerSideAuthConfig() {
+  try {
+    const configPath = path.join(__dirname, 'firebase-applet-config.json');
+    if (fs.existsSync(configPath)) {
+      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      return {
+        apiKey: process.env.FIREBASE_API_KEY || parsed.apiKey || '',
+        authDomain: process.env.FIREBASE_AUTH_DOMAIN || parsed.authDomain || '',
+        projectId: process.env.FIREBASE_PROJECT_ID || parsed.projectId || '',
+        appId: process.env.FIREBASE_APP_ID || parsed.appId || '',
+      };
+    }
+  } catch {
+    // Fallback to environment variables
+  }
+  return {
+    apiKey: process.env.FIREBASE_API_KEY || '',
+    authDomain: process.env.FIREBASE_AUTH_DOMAIN || '',
+    projectId: process.env.FIREBASE_PROJECT_ID || '',
+    appId: process.env.FIREBASE_APP_ID || '',
+  };
+}
+
 function normalizeScannedIsbn(rawInput: string): string {
   const cleaned = cleanIsbn(rawInput);
   if (cleaned.length === 10) {
@@ -303,7 +389,13 @@ async function resolveIsbnMetadata(isbn13: string): Promise<{
     return { ...KNOWN_ISBN_CATALOG[isbn13], isCustomIsbn: false };
   }
 
-  // 4. Query OpenLibrary API with a 3.5s timeout
+  // 4. Check in-memory resolved ISBN cache
+  const cachedMeta = isbnMetadataCache.get(isbn13);
+  if (cachedMeta) {
+    return cachedMeta;
+  }
+
+  // 5. Query free OpenLibrary API with a 3.5s timeout
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
@@ -326,7 +418,7 @@ async function resolveIsbnMetadata(isbn13: string): Promise<{
             ? entry.subjects[0].name || 'General Collection'
             : 'General Collection';
         const yearMatch = String(entry.publish_date || '').match(/\b(18|19|20)\d{2}\b/);
-        return {
+        const resolvedObj = {
           title: String(entry.title),
           author: authorNames || 'Unknown Author',
           category: String(subjectName).slice(0, 36),
@@ -334,13 +426,15 @@ async function resolveIsbnMetadata(isbn13: string): Promise<{
           publishedYear: yearMatch ? yearMatch[0] : '2024',
           isCustomIsbn: isbn13.startsWith('979000'),
         };
+        isbnMetadataCache.set(isbn13, resolvedObj);
+        return resolvedObj;
       }
     }
   } catch {
     // Fall back gracefully if offline or blocked
   }
 
-  return {
+  const fallbackObj = {
     title: `Cataloged Volume (${formatIsbn13(isbn13)})`,
     author: 'Library Acquisition',
     category: isbn13.startsWith('979000') ? 'Custom Barcode' : 'General Collection',
@@ -348,6 +442,8 @@ async function resolveIsbnMetadata(isbn13: string): Promise<{
     publishedYear: new Date().getFullYear().toString(),
     isCustomIsbn: isbn13.startsWith('979000'),
   };
+  isbnMetadataCache.set(isbn13, fallbackObj);
+  return fallbackObj;
 }
 
 function nowTimestamp(): string {
@@ -364,10 +460,37 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '256kb' }));
 
-  // GET /api/books - Return the live dataset list and connected spreadsheet info
+  // Block any public HTTP access to sensitive configuration or backend files
+  app.use((req, res, next) => {
+    const lowerPath = req.path.toLowerCase();
+    if (
+      lowerPath.includes('firebase-applet-config.json') ||
+      lowerPath.includes('firebase-blueprint.json') ||
+      lowerPath.includes('firestore.rules') ||
+      lowerPath.startsWith('/.env') ||
+      lowerPath.startsWith('/data/')
+    ) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+    next();
+  });
+
+  // POST /api/auth/session-config - Provides auth configuration on-demand when Librarian clicks Sign In
+  app.post('/api/auth/session-config', (req, res) => {
+    if (req.headers['x-requested-with'] !== 'LibrarianAuth') {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(getServerSideAuthConfig());
+  });
+
+  // GET /api/books - Serves the live dataset from in-memory cache (0 external API calls, $0 cost regardless of traffic)
   app.get('/api/books', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-cache');
     res.json({
       books: booksList,
       connectedSheet: connectedSheetInfo,
@@ -434,6 +557,7 @@ async function startServer() {
 
     const outcome = upsertScannedBook(booksList, candidateBook);
     booksList = outcome.books;
+    savePersistedCatalogCache();
 
     res.status(outcome.incrementedCopy ? 200 : 201).json({
       book: outcome.book,
@@ -484,6 +608,7 @@ async function startServer() {
         publishedYear: cleanYear,
         copyCount: (booksList[existingIdx].copyCount || 1) + 1,
       };
+      savePersistedCatalogCache();
       res.status(200).json({
         book: booksList[existingIdx],
         books: booksList,
@@ -507,6 +632,7 @@ async function startServer() {
     };
 
     booksList = [newBook, ...booksList];
+    savePersistedCatalogCache();
 
     res.status(201).json({
       book: newBook,
@@ -519,6 +645,7 @@ async function startServer() {
   app.delete('/api/books/:id', (req, res) => {
     const { id } = req.params;
     booksList = booksList.filter((b) => b.id !== id);
+    savePersistedCatalogCache();
     res.json({ books: booksList });
   });
 
@@ -535,6 +662,7 @@ async function startServer() {
         sheetTabName: sheetTabName || 'Catalog',
         lastSyncedAt: nowTimestamp(),
       };
+      savePersistedCatalogCache();
     }
     res.json({ connectedSheet: connectedSheetInfo });
   });
@@ -683,6 +811,7 @@ async function startServer() {
         sheetTabName,
         lastSyncedAt: nowTimestamp(),
       };
+      savePersistedCatalogCache();
 
       res.json({
         books: booksList,
